@@ -1,0 +1,6 @@
+noisytcp
+*.o
+lab/*.log
+lab/*.pid
+lab/*.qcow2
+lab/monitor.log
